@@ -7,10 +7,12 @@ import os
 from pathlib import Path
 from typing import Any
 
+import backoff
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_chroma import Chroma
+from openai import RateLimitError, APIConnectionError
 
 logger = logging.getLogger("schema_therapy_bot")
 logger.setLevel(logging.INFO)
@@ -28,6 +30,12 @@ EMBEDDING_MODEL  = "text-embedding-3-small"
 CHAT_MODEL       = "gpt-4o-mini"
 
 BOOKS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@backoff.on_exception(backoff.expo, (RateLimitError, APIConnectionError), max_tries=4)
+def _call_llm_with_backoff(llm_instance, messages):
+    """Invoke LLM with exponential backoff on transient errors."""
+    return llm_instance.invoke(messages)
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
@@ -179,15 +187,13 @@ def translate_query(user_query: str) -> list[str]:
     Rewrite the user query into 3 search variants using schema therapy vocabulary.
     Query translation improves retrieval recall significantly.
     """
-    llm = ChatOpenAI(model=CHAT_MODEL, temperature=0.0)
-    prompt = (
-        "Rewrite the user question into 3 short search queries for retrieving relevant "
-        "passages from schema therapy books. Use clinical/schema therapy vocabulary.\n"
-        "Return as a JSON list of strings only, no explanation.\n\n"
-        f"User question: {user_query}"
-    )
+    from prompts import load_prompts
+    prompts = load_prompts()
+
+    llm = ChatOpenAI(model=CHAT_MODEL, temperature=0.0, request_timeout=30)
+    prompt = prompts["query_translation_prompt"].format(user_query=user_query)
     try:
-        resp = llm.invoke(prompt)
+        resp = _call_llm_with_backoff(llm, prompt)
         arr  = json.loads(resp.content)
         if isinstance(arr, list) and all(isinstance(x, str) for x in arr):
             return arr[:3]

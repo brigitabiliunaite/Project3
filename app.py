@@ -1,46 +1,74 @@
-# app.py  –  Schema Therapy Bot  (Streamlit)
-# Meets all core requirements + 2 medium + 1 hard optional tasks
+# app.py  –  Schema Therapy Agent  (Streamlit + LangGraph ReAct)
+#
+# Sprint 3 upgrade: proper ReAct agent with agentic RAG, 5 tools,
+# multi-model support, personality selector, feedback loop, tool toggles.
 
 import json
 import os
+import re
+import unicodedata
+import uuid
 from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 
-from costs import calculate_cost, format_cost
+from agent import (
+    ANTHROPIC_AVAILABLE,
+    create_therapy_agent,
+    detect_language,
+    get_checkpointer,
+)
+from costs import (
+    MODEL_DISPLAY_NAMES,
+    PROVIDER_MODELS,
+    calculate_cost,
+    format_cost,
+)
+from feedback import get_feedback_insights, load_feedback, save_feedback_entry
 from rag import (
-    advanced_retrieve,
     book_is_loaded,
     get_loaded_books,
     ingest_books_folder,
-    needs_rebuild,
     read_index_stats,
 )
-from tools import find_technique, save_session, search_memory
+from tools import ALL_TOOLS, TOOL_DESCRIPTIONS
 
 load_dotenv()
 
-# ── Security & validation ──────────────────────────────────────────────────────
+
+# ── Security & validation ────────────────────────────────────────────────────
 MAX_MESSAGE_LENGTH   = 2000
 MAX_MESSAGES_SESSION = 50
 RATE_LIMIT_SECONDS   = 5
+
+
+def _normalise(text: str) -> str:
+    """Normalise text for prompt-injection detection."""
+    text = unicodedata.normalize("NFKD", text)
+    text = re.sub(r"[\s\W]+", " ", text.lower())
+    return text
+
 
 def validate_input(text: str) -> tuple[bool, str]:
     if not text or not text.strip():
         return False, "Please enter a message."
     if len(text) > MAX_MESSAGE_LENGTH:
         return False, f"Message too long ({len(text)} chars). Keep it under {MAX_MESSAGE_LENGTH}."
+    normalised = _normalise(text)
     suspicious = [
         "ignore previous instructions", "ignore all instructions",
-        "you are now", "disregard your instructions", "forget your system prompt",
+        "you are now", "disregard your instructions",
+        "forget your system prompt", "override your constraints",
+        "new persona", "act as", "jailbreak",
+        "discard your rules",
     ]
-    if any(p in text.lower() for p in suspicious):
+    if any(p in normalised for p in suspicious):
         return False, "I noticed something unusual in your message. Please rephrase."
     return True, ""
+
 
 def check_rate_limit() -> bool:
     last = st.session_state.get("last_message_time")
@@ -48,15 +76,57 @@ def check_rate_limit() -> bool:
         return True
     return (datetime.now() - last).total_seconds() >= RATE_LIMIT_SECONDS
 
-# ── Page config ────────────────────────────────────────────────────────────────
+
+def repair_chat_history(thread_id: str) -> None:
+    """Fix corrupted chat history where AIMessages have tool_calls without
+    corresponding ToolMessages. This can happen when rapid messages interrupt
+    a tool call mid-stream. Adds placeholder ToolMessages so the session recovers."""
+    checkpointer = get_checkpointer()
+    config = {"configurable": {"thread_id": thread_id}}
+    checkpoint_tuple = checkpointer.get_tuple(config)
+    if checkpoint_tuple is None:
+        return
+
+    checkpoint = checkpoint_tuple.checkpoint
+    messages = checkpoint.get("channel_values", {}).get("messages", [])
+    if not messages:
+        return
+
+    repaired = []
+    needs_repair = False
+    for msg in messages:
+        repaired.append(msg)
+        # If this is an AI message with tool calls, check if next message is a ToolMessage
+        if isinstance(msg, AIMessage) and getattr(msg, "tool_calls", None):
+            for tc in msg.tool_calls:
+                tc_id = tc.get("id", "unknown")
+                # Check if a matching ToolMessage already follows
+                has_result = any(
+                    isinstance(m, ToolMessage) and getattr(m, "tool_call_id", None) == tc_id
+                    for m in messages[messages.index(msg) + 1:]
+                )
+                if not has_result:
+                    needs_repair = True
+                    repaired.append(ToolMessage(
+                        content="[Tool call interrupted — no result available]",
+                        tool_call_id=tc_id,
+                        name=tc.get("name", "unknown"),
+                    ))
+
+    if needs_repair:
+        checkpoint["channel_values"]["messages"] = repaired
+        checkpointer.put(config, checkpoint, checkpoint_tuple.metadata, checkpoint_tuple.parent_config)
+
+
+# ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Schema Therapy Bot",
+    page_title="Schema Therapy Agent",
     page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── CSS ────────────────────────────────────────────────────────────────────────
+# ── CSS ──────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
@@ -101,75 +171,6 @@ html, body, [class*="css"], .stApp {
     padding-bottom: 1.2rem;
     border-bottom: 1px solid #efefef;
     margin-bottom: 1.6rem;
-}
-
-/* Messages */
-.msg-row {
-    display: flex;
-    gap: 10px;
-    margin-bottom: 1.2rem;
-    align-items: flex-start;
-}
-.msg-row.user { flex-direction: row-reverse; }
-.avatar {
-    width: 30px; height: 30px;
-    border-radius: 50%;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 0.78rem; font-weight: 600;
-    flex-shrink: 0; margin-top: 2px;
-}
-.avatar.bot  { background: #f0f0f0; color: #555; font-size: 0.9rem; }
-.avatar.user { background: #1a1a1a; color: #fff; font-size: 0.68rem; }
-.bubble {
-    max-width: 84%;
-    padding: 0.7rem 0.95rem;
-    border-radius: 12px;
-    font-size: 0.9rem;
-    line-height: 1.65;
-}
-.bubble.bot {
-    background: #f7f7f7;
-    color: #1a1a1a;
-    border: 1px solid #ececec;
-    border-top-left-radius: 3px;
-}
-.bubble.user {
-    background: #1a1a1a;
-    color: #fff;
-    border-top-right-radius: 3px;
-}
-.msg-meta {
-    font-size: 0.68rem;
-    color: #ccc;
-    margin-top: 3px;
-    margin-left: 40px;
-}
-.info-box {
-    margin-top: 5px;
-    margin-left: 40px;
-    background: #fafafa;
-    border: 1px solid #f0f0f0;
-    border-radius: 8px;
-    padding: 0.45rem 0.75rem;
-    font-size: 0.73rem;
-    color: #888;
-    line-height: 1.5;
-}
-.info-box b { color: #555; }
-
-/* Input */
-.stTextArea textarea {
-    background: #fff !important;
-    border: 1px solid #e0e0e0 !important;
-    border-radius: 10px !important;
-    color: #1a1a1a !important;
-    font-family: 'Inter', sans-serif !important;
-    font-size: 0.9rem !important;
-    resize: none !important;
-}
-.stTextArea textarea:focus {
-    border-color: #999 !important;
-    box-shadow: 0 0 0 2px rgba(0,0,0,0.05) !important;
 }
 
 /* Buttons */
@@ -219,17 +220,16 @@ footer    { visibility: hidden; }
 """, unsafe_allow_html=True)
 
 
-# ── Auto-load books from data/books/ folder ────────────────────────────────────
+# ── Auto-load books ──────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def auto_load_books():
-    """Load all PDFs from data/books/ on startup."""
     return ingest_books_folder()
 
-with st.spinner("Loading knowledge base…"):
-    book_load_result = auto_load_books()
+with st.spinner("Loading knowledge base..."):
+    auto_load_books()
 
 
-# ── Session state ──────────────────────────────────────────────────────────────
+# ── Session state ────────────────────────────────────────────────────────────
 def init_state():
     defaults = {
         "messages": [],
@@ -239,6 +239,7 @@ def init_state():
         "last_prompt_tokens": 0,
         "session_saved": False,
         "last_message_time": None,
+        "thread_id": str(uuid.uuid4()),
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -247,252 +248,21 @@ def init_state():
 init_state()
 
 
-# ── LLM ───────────────────────────────────────────────────────────────────────
-@st.cache_resource
-def get_llm():
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        st.error("OPENAI_API_KEY not found. Please add it to your .env file.")
-        st.stop()
-    return ChatOpenAI(model="gpt-4o-mini", temperature=0.6, api_key=api_key)
-
-llm          = get_llm()
-tools_list   = [save_session, search_memory, find_technique]
-llm_with_tools = llm.bind_tools(tools_list)
-
-SYSTEM_PROMPT = """You are an expert Schema Therapy coach, trained in Jeffrey Young's model. \
-You have read the user's books deeply. You are warm but direct — you explain, teach, and give \
-practical help. You do NOT give generic therapy advice. Every answer should feel different and \
-tailored to exactly what the person just said.
-
-HOW TO RESPOND:
-- Read what the person said carefully. Respond to THEIR specific situation, not a template.
-- When relevant, name the Schema Mode at work (Vulnerable Child, Angry Child, Detached Protector, \
-  Punitive Parent, Healthy Adult) and explain what it means FOR THEM specifically.
-- When relevant, name the Schema driving it (Abandonment, Emotional Deprivation, Defectiveness, \
-  Subjugation, Mistrust, etc.) and explain why they feel this way.
-- Use the retrieved book passages to ground your answer. Quote or reference the books naturally.
-- Vary your responses. Not every answer needs numbered steps. Sometimes a short explanation is \
-  better. Sometimes a question. Sometimes a technique. Read the situation.
-- If someone is in emotional pain, be human first — then explain. If someone asks a factual \
-  question, answer it directly.
-
-TOOLS — use precisely:
-- find_technique: call when the user asks for exercises, techniques, or step-by-step practices in any form — "give me an exercise", "what exercises exist", "more exercises", "give me a technique for X", "duok pratimų", "daugiau pratimų". Do NOT call it for general questions about schemas or "what can you help me with". Call it at most ONCE per response.
-- search_memory: call ONLY when the user explicitly references past sessions — "remember", "last time", "before", "previous session", "we talked about". Do not call it on the very first message.
-- save_session: call when the user says goodbye, wants to end, or asks to save.
-
-LANGUAGE RULE — CRITICAL:
-Look at the user's LAST message only. Detect its language. Write your ENTIRE response in that language.
-Lithuanian last message → entire response in Lithuanian.
-English last message → entire response in English.
-This applies even after tool calls — the tool result language does not matter, only the user's message language.
-Never mix languages in one response.
-
-ENDING RULE:
-Never end your response with a question like "Would you like to explore this further?" or "Shall we discuss more?"
-These feel robotic and disconnected. End with a statement, an insight, or an invitation to share more — but not a hollow question.
-
-Security: Only discuss emotional wellbeing, schemas, relationships, and psychological patterns.
-
-Book passages are provided below each message. Today's date: {date}""".format(date=datetime.now().strftime("%B %d, %Y"))
-
-
-def run_agent(user_message: str) -> dict:
-    """
-    Run one agent turn. Returns a dict with:
-    reply, cost, tokens, sources, tools_used, query_variants
-    """
-    # Advanced RAG: retrieve with query translation
-    docs, query_variants = advanced_retrieve(user_message, k=6)
-
-    sources = []
-    passages = []
-    for doc in docs:
-        page      = doc.metadata.get("page", "?")
-        book_name = doc.metadata.get("source_book", doc.metadata.get("source", "book"))
-        passages.append(f"[{book_name} p.{page}] {doc.page_content}")
-        sources.append({
-            "page":      page,
-            "book":      book_name,
-            "snippet":   doc.page_content[:150] + "…",
-        })
-
-    # Build message history (last 10 turns)
-    history = []
-    for msg in st.session_state.messages[-10:]:
-        if msg["role"] == "user":
-            history.append(HumanMessage(content=msg["content"]))
-        else:
-            history.append(AIMessage(content=msg["content"]))
-
-    augmented = user_message
-    if passages:
-        augmented += "\n\n[KNOWLEDGE BASE — retrieved automatically from indexed books, NOT provided by the user]:\n" + "\n\n---\n\n".join(passages)
-
-    # Detect user language explicitly and inject into system prompt
-    # This ensures tool results (which may be in a different language) don't pollute the response language
-    def _detect_language(text: str) -> str:
-        # Lithuanian special characters are 100% reliable when present
-        if any(c in "ąčęėįšųūžĄČĘĖĮŠŲŪŽ" for c in text):
-            return "Lithuanian"
-        # Lithuanian words that don't exist in other languages
-        lt_words = {
-            "aš", "jis", "ji", "mes", "jūs", "yra", "buvo", "kaip", "ką",
-            "labai", "taip", "dėl", "noriu", "galiu", "žinau", "kodėl",
-            "ar", "prisimeni", "kokia", "mano", "spalva", "kas", "apie",
-            "kada", "kuris", "kuri", "jeigu", "nes", "bet", "arba",
-            "norėčiau", "gali", "negali", "nežinau", "suprantu", "jaučiu",
-            "jaučiuosi", "manau", "galvoju", "sakau", "klausiu",
-        }
-        words = set(text.lower().replace("?", "").replace(".", "").replace(",", "").split())
-        if len(words & lt_words) >= 1:
-            return "Lithuanian"
-        # Try langdetect for everything else
-        try:
-            from langdetect import detect
-            code = detect(text)
-            lang_names = {
-                "lt": "Lithuanian", "en": "English", "de": "German",
-                "fr": "French", "es": "Spanish", "it": "Italian",
-                "pl": "Polish", "ru": "Russian", "pt": "Portuguese",
-                "nl": "Dutch", "sv": "Swedish", "no": "Norwegian",
-                "da": "Danish", "fi": "Finnish", "lv": "Latvian",
-                "et": "Estonian", "uk": "Ukrainian", "cs": "Czech",
-            }
-            return lang_names.get(code, code)
-        except Exception:
-            return "English"
-
-    detected_lang = _detect_language(user_message)
-    lang_instruction = (
-        f"\n\nCRITICAL LANGUAGE OVERRIDE: The user's current message is in {detected_lang}. "
-        f"You MUST respond ENTIRELY in {detected_lang}. "
-        f"The conversation history may be in a different language — ignore that. "
-        f"Only the language of the CURRENT message matters. "
-        f"Do NOT write even one sentence in any other language."
-    )
-    system_with_lang = SystemMessage(content=SYSTEM_PROMPT + lang_instruction)
-    # Add a final reminder right before the user message so it's the last thing the LLM reads
-    lang_reminder = SystemMessage(content=f"REMINDER: Respond in {detected_lang} only.")
-    messages = [system_with_lang] + history + [lang_reminder, HumanMessage(content=augmented)]
-
-    total_cost   = 0.0
-    total_tokens = 0
-    tools_used   = []
-
-    response = llm_with_tools.invoke(messages)
-    meta     = response.usage_metadata or {}
-    in_tok   = meta.get("input_tokens", 0)
-    out_tok  = meta.get("output_tokens", 0)
-    total_tokens += in_tok + out_tok
-    total_cost   += calculate_cost("gpt-4o-mini", in_tok, out_tok)
-
-    if response.tool_calls:
-        messages.append(response)
-        from langchain_core.messages import ToolMessage
-        tool_map = {t.name: t for t in tools_list}
-
-        for tc in response.tool_calls:
-            tool_name = tc["name"]
-            tool_args = tc["args"]
-            tool_fn   = tool_map.get(tool_name)
-            tools_used.append(tool_name)
-
-            if tool_fn:
-                if tool_name == "save_session" and "conversation" not in tool_args:
-                    tool_args = {"conversation": "\n".join(
-                        f"{'Client' if m['role']=='user' else 'Therapist'}: {m['content']}"
-                        for m in st.session_state.messages
-                    )}
-                try:
-                    tool_result = tool_fn.invoke(tool_args)
-                    if tool_name == "save_session":
-                        st.session_state.session_saved = True
-                except Exception as e:
-                    tool_result = f"Tool error: {str(e)}"
-            else:
-                tool_result = "Tool not found."
-
-            messages.append(ToolMessage(content=str(tool_result), tool_call_id=tc["id"]))
-
-        final    = llm_with_tools.invoke(messages)
-        meta2    = final.usage_metadata or {}
-        in2, out2 = meta2.get("input_tokens", 0), meta2.get("output_tokens", 0)
-        total_tokens += in2 + out2
-        total_cost   += calculate_cost("gpt-4o-mini", in2, out2)
-        final_response = final.content
-    else:
-        final_response = response.content
-
-    return {
-        "reply":          final_response,
-        "cost":           total_cost,
-        "tokens":         total_tokens,
-        "sources":        sources,
-        "tools_used":     tools_used,
-        "query_variants": query_variants,
-    }
-
-
-# ── SIDEBAR ────────────────────────────────────────────────────────────────────
+# ── SIDEBAR ──────────────────────────────────────────────────────────────────
 with st.sidebar:
 
-    # Knowledge base status
-    st.markdown("### Knowledge Base")
-    loaded_books = get_loaded_books()
-    if loaded_books:
-        for b in loaded_books:
-            st.markdown(
-                f'<span class="pill pill-green">✓</span> '
-                f'<span style="font-size:0.78rem;color:#555">{b[:36]}</span>',
-                unsafe_allow_html=True,
-            )
-        st.caption(f"{len(loaded_books)} book(s) in data/books/")
-    else:
-        st.markdown('<span class="pill pill-gray">No books in data/books/</span>', unsafe_allow_html=True)
-        st.caption("Add PDF files to the data/books/ folder.")
-
-    if st.button("🔄 Update Book Index", use_container_width=True):
-        if loaded_books:
-            with st.spinner("Indexing books… this may take a minute."):
-                try:
-                    result = ingest_books_folder(force=True)
-                    st.cache_resource.clear()
-                    st.success(f"✓ {result.get('books', 0)} book(s) · {result.get('chunks', 0)} chunks indexed.")
-                except Exception as e:
-                    st.error(f"Indexing failed: {e}")
-        else:
-            st.warning("No PDFs found in data/books/")
-
-    stats = read_index_stats()
-    if stats:
-        with st.expander("Index details", expanded=False):
-            for book, chunks in stats.items():
-                st.caption(f"{book[:40]}: {chunks} chunks")
-
-    st.markdown("---")
-    st.markdown("### Session")
-
+    # ── Session controls (top — most important) ───────────────────────────
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Save & End", use_container_width=True):
             if st.session_state.messages:
-                with st.spinner("Saving…"):
-                    # Skip the welcome message (first assistant message with no prior user message)
-                    real_msgs = [m for m in st.session_state.messages
-                                 if not (m["role"] == "assistant" and "I'm glad you're here" in m.get("content", ""))]
-                    if not real_msgs:
-                        st.warning("Nothing meaningful to save yet.")
-                        st.stop()
-                    conv   = "\n".join(
-                        f"{'Client' if m['role']=='user' else 'Therapist'}: {m['content']}"
-                        for m in real_msgs
-                    )
-                    result = save_session.invoke({"conversation": conv})
-                    st.session_state.session_saved = True
-                    # Show save confirmation then clear chat — session is truly ended
-                    st.session_state.messages = [{"role": "assistant", "content": result + "\n\n---\n*Session ended. Click **New Session** to start a new conversation.*"}]
+                with st.spinner("Saving..."):
+                    from tools import save_session
+                    result = save_session.invoke({"reason": "User clicked Save & End"})
+                    st.session_state.messages = [{
+                        "role": "assistant",
+                        "content": result + "\n\n---\n*Session ended. Click **New Session** to start a new conversation.*",
+                    }]
                 st.rerun()
             else:
                 st.warning("Nothing to save.")
@@ -501,23 +271,148 @@ with st.sidebar:
             for key in ["messages", "session_cost", "session_tokens",
                         "last_prompt_cost", "last_prompt_tokens",
                         "session_saved", "last_message_time"]:
-                st.session_state[key] = [] if key == "messages" else (0.0 if "cost" in key or "tokens" in key else None if key == "last_message_time" else False)
+                if key == "messages":
+                    st.session_state[key] = []
+                elif "cost" in key or "tokens" in key:
+                    st.session_state[key] = 0.0 if "cost" in key else 0
+                elif key == "last_message_time":
+                    st.session_state[key] = None
+                else:
+                    st.session_state[key] = False
+            st.session_state.thread_id = str(uuid.uuid4())
             st.rerun()
 
     st.markdown("---")
-    st.markdown("### Usage & Cost")
+
+    # ── Settings (collapsed by default — keeps sidebar clean) ─────────────
+    with st.expander("Settings", expanded=False):
+        # Model
+        available_providers = ["OpenAI"]
+        if os.environ.get("ANTHROPIC_API_KEY") and ANTHROPIC_AVAILABLE:
+            available_providers.append("Anthropic")
+
+        provider = st.selectbox(
+            "Provider",
+            available_providers,
+            key="provider",
+        )
+
+        model_options = PROVIDER_MODELS.get(provider, ["gpt-4o-mini"])
+        model_display = [MODEL_DISPLAY_NAMES.get(m, m) for m in model_options]
+        model_idx = st.selectbox(
+            "Model",
+            range(len(model_options)),
+            format_func=lambda i: model_display[i],
+            key="model_idx",
+        )
+        selected_model = model_options[model_idx]
+
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            st.caption("Add `ANTHROPIC_API_KEY` to .env for Anthropic.")
+
+        # Personality
+        personality_options = {
+            "Warm & Supportive": "warm",
+            "Professional & Clinical": "professional",
+            "Concise & Direct": "concise",
+        }
+        personality_label = st.selectbox(
+            "Response style",
+            list(personality_options.keys()),
+            key="personality_label",
+        )
+        selected_personality = personality_options[personality_label]
+
+    # Read settings from expander (defaults if never opened)
+    if "provider" not in st.session_state:
+        provider = "OpenAI"
+        selected_model = "gpt-4o-mini"
+        selected_personality = "warm"
+    else:
+        provider = st.session_state.provider
+        model_options = PROVIDER_MODELS.get(provider, ["gpt-4o-mini"])
+        model_idx_val = st.session_state.get("model_idx", 0)
+        selected_model = model_options[model_idx_val] if model_idx_val < len(model_options) else model_options[0]
+        personality_label = st.session_state.get("personality_label", "Warm & Supportive")
+        personality_options = {
+            "Warm & Supportive": "warm",
+            "Professional & Clinical": "professional",
+            "Concise & Direct": "concise",
+        }
+        selected_personality = personality_options.get(personality_label, "warm")
+
+    # ── Tools (collapsed by default) ──────────────────────────────────────
+    with st.expander("Tools", expanded=False):
+        tool_states = {}
+        for tool_name, description in TOOL_DESCRIPTIONS.items():
+            if tool_name == "save_session":
+                tool_states[tool_name] = True
+                st.checkbox(description, value=True, disabled=True, key=f"tool_{tool_name}")
+            else:
+                tool_states[tool_name] = st.checkbox(
+                    description, value=True, key=f"tool_{tool_name}",
+                )
+
+    # Read tool states (defaults if never opened)
+    if "tool_retrieve_from_books" not in st.session_state:
+        tool_states = {name: True for name in TOOL_DESCRIPTIONS}
+    else:
+        tool_states = {}
+        for tool_name in TOOL_DESCRIPTIONS:
+            if tool_name == "save_session":
+                tool_states[tool_name] = True
+            else:
+                tool_states[tool_name] = st.session_state.get(f"tool_{tool_name}", True)
+
+    st.markdown("---")
+
+    # ── Usage & Cost (always visible — compact) ──────────────────────────
+    st.markdown("### Usage")
     st.markdown(f"""
     <div class="cost-row">
+        <span class="cost-label">Model</span>
+        <span class="cost-value">{MODEL_DISPLAY_NAMES.get(selected_model, selected_model)}</span>
+    </div>
+    <div class="cost-row">
         <span class="cost-label">Last message</span>
-        <span class="cost-value">{st.session_state.last_prompt_tokens:,} tokens · {format_cost(st.session_state.last_prompt_cost)}</span>
+        <span class="cost-value">{st.session_state.last_prompt_tokens:,} tok · {format_cost(st.session_state.last_prompt_cost)}</span>
     </div>
     <div class="cost-row" style="border:none">
-        <span class="cost-label">This session</span>
-        <span class="cost-value">{st.session_state.session_tokens:,} tokens · {format_cost(st.session_state.session_cost)}</span>
+        <span class="cost-label">Session total</span>
+        <span class="cost-value">{st.session_state.session_tokens:,} tok · {format_cost(st.session_state.session_cost)}</span>
     </div>
     """, unsafe_allow_html=True)
 
     st.markdown("---")
+
+    # ── Knowledge base (compact) ──────────────────────────────────────────
+    st.markdown("### Books")
+    loaded_books = get_loaded_books()
+    if loaded_books:
+        for b in loaded_books:
+            st.markdown(
+                f'<span class="pill pill-green">✓</span> '
+                f'<span style="font-size:0.75rem;color:#555">{b[:32]}</span>',
+                unsafe_allow_html=True,
+            )
+    else:
+        st.caption("Add PDFs to data/books/")
+
+    if st.button("Update Index", use_container_width=True):
+        if loaded_books:
+            with st.spinner("Indexing..."):
+                try:
+                    result = ingest_books_folder(force=True)
+                    st.cache_resource.clear()
+                    st.success(f"✓ {result.get('books', 0)} book(s) indexed.")
+                except Exception as e:
+                    st.error(f"Failed: {e}")
+        else:
+            st.warning("No PDFs found.")
+
+    st.markdown("---")
+
+    # ── Past sessions (compact — just titles and dates) ───────────────────
     st.markdown("### Past Sessions")
     sessions_dir = Path("data/sessions")
     if sessions_dir.exists():
@@ -526,12 +421,13 @@ with st.sidebar:
             for sf in session_files:
                 try:
                     data = json.loads(sf.read_text())
-                    ts   = data.get("timestamp", "")[:8]
+                    ts = data.get("timestamp", "")[:8]
                     if len(ts) == 8:
                         ts = f"{ts[:4]}-{ts[4:6]}-{ts[6:]}"
-                    with st.expander(data.get("title", sf.stem)[:50]):
-                        st.caption(ts)
-                        st.write(data.get("summary", ""))
+                    title = data.get("title", sf.stem)[:45]
+                    themes = data.get("key_themes", [])
+                    theme_str = f" · {', '.join(themes[:2])}" if themes else ""
+                    st.caption(f"**{title}** — {ts}{theme_str}")
                 except Exception:
                     pass
         else:
@@ -539,19 +435,48 @@ with st.sidebar:
     else:
         st.caption("No saved sessions yet.")
 
+    # ── Feedback stats (only if exists) ───────────────────────────────────
+    feedback_entries = load_feedback()
+    if feedback_entries:
+        st.markdown("---")
+        recent = feedback_entries[-20:]
+        pos = sum(1 for e in recent if e["rating"] == "positive")
+        neg = len(recent) - pos
+        st.caption(f"Feedback: {pos} 👍 / {neg} 👎")
+
+    # ── Help (at the very bottom) ─────────────────────────────────────────
+    st.markdown("---")
+    with st.expander("Help", expanded=False):
+        st.markdown("""
+**Example messages:**
+- *"What is the abandonment schema?"*
+- *"I feel like nobody really cares about me"*
+- *"Give me an exercise for emotional deprivation"*
+- *"Do you remember what we talked about last time?"*
+
+**Tips:**
+- Write in any language — I'll respond in yours
+- Use 👍/👎 to rate responses — I learn from feedback
+- Open **Settings** to switch models or personality
+- Open **Tools** to enable/disable agent capabilities
+        """)
 
 
-
-# ── MAIN CHAT ──────────────────────────────────────────────────────────────────
-st.markdown('<div class="app-title">🧠 Schema Therapy Bot</div>', unsafe_allow_html=True)
-st.markdown('<div class="app-subtitle">Evidence-based schema therapy · Multilingual · Grounded in your books</div>', unsafe_allow_html=True)
+# ── MAIN CHAT ────────────────────────────────────────────────────────────────
+st.markdown('<div class="app-title">🧠 Schema Therapy Agent</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="app-subtitle">'
+    'Evidence-based schema therapy · ReAct agent · Agentic RAG · Multilingual'
+    '</div>',
+    unsafe_allow_html=True,
+)
 
 # Session length warning
 msg_count = len([m for m in st.session_state.messages if m["role"] == "user"])
 if msg_count >= MAX_MESSAGES_SESSION:
     st.warning(f"You've sent {msg_count} messages. Consider saving and starting a new session.")
 
-# Welcome
+# Welcome message
 if not st.session_state.messages:
     st.session_state.messages.append({
         "role": "assistant",
@@ -565,17 +490,18 @@ if not st.session_state.messages:
         ),
     })
 
-# Render messages using native Streamlit chat — proper markdown rendering
-for msg in st.session_state.messages:
-    role       = msg["role"]
-    tokens_info = msg.get("tokens_info", "")
-    sources     = msg.get("sources", [])
-    tools_used  = msg.get("tools_used", [])
-
+# ── Render messages with feedback buttons ─────────────────────────────────────
+for i, msg in enumerate(st.session_state.messages):
+    role = msg["role"]
     with st.chat_message(role, avatar="🧠" if role == "assistant" else "👤"):
         st.markdown(msg["content"])
 
         if role == "assistant":
+            # Show metadata
+            tokens_info = msg.get("tokens_info", "")
+            sources = msg.get("sources", [])
+            tools_used = msg.get("tools_used", [])
+
             if tokens_info:
                 st.caption(tokens_info)
             if sources:
@@ -584,72 +510,205 @@ for msg in st.session_state.messages:
             if tools_used:
                 st.caption(f"🔧 Tools: {', '.join(tools_used)}")
 
-# Input — st.chat_input supports Enter key natively
+            # Feedback buttons (skip welcome message and session-end messages)
+            if i > 0 and "Session ended" not in msg.get("content", ""):
+                fb_key = f"feedback_{i}_{st.session_state.thread_id}"
+                feedback = st.feedback("thumbs", key=fb_key)
+                if feedback is not None:
+                    # Only save if we haven't already recorded feedback for this message
+                    saved_key = f"feedback_saved_{i}_{st.session_state.thread_id}"
+                    if saved_key not in st.session_state:
+                        rating = "positive" if feedback == 1 else "negative"
+                        save_feedback_entry(i, rating, msg.get("content", "")[:300])
+                        st.session_state[saved_key] = True
+
+
+# ── Input handling ────────────────────────────────────────────────────────────
 if not book_is_loaded():
     st.caption("⚠️ No books found. Add PDFs to data/books/ and restart.")
+
 if st.session_state.get("session_saved"):
     st.info("Session ended. Click **New Session** in the sidebar to start a new conversation.")
     user_input = None
 else:
-    user_input = st.chat_input("Write a message…")
-if user_input and user_input.strip():
-    now = datetime.now()
-    last = st.session_state.get("last_message_time")
-    if last is not None:
-        elapsed = (now - last).total_seconds()
-        remaining = RATE_LIMIT_SECONDS - elapsed
-        if remaining > 0:
-            secs = int(remaining) + 1
-            st.warning(f"⏳ Please wait **{secs} second{'s' if secs != 1 else ''}** before sending another message.")
-            st.stop()
+    user_input = st.chat_input("Write a message...")
 
+if user_input and user_input.strip():
+    # Rate limit
+    if not check_rate_limit():
+        remaining = RATE_LIMIT_SECONDS - (datetime.now() - st.session_state.last_message_time).total_seconds()
+        st.warning(f"Please wait {int(remaining) + 1} seconds before sending another message.")
+        st.stop()
+
+    # Validate
     is_valid, error_msg = validate_input(user_input)
     if not is_valid:
         st.error(error_msg)
         st.stop()
-    st.session_state.messages.append({"role": "user", "content": user_input.strip()})
 
-    # Render user message immediately
-    with st.chat_message("user", avatar="👤"):
-        st.markdown(user_input.strip())
+    user_text = user_input.strip()
 
-    # Run agent and render response
-    with st.chat_message("assistant", avatar="🧠"):
-        with st.spinner("Thinking…"):
-            try:
-                result = run_agent(user_input.strip())
-            except Exception as e:
-                result = {
-                    "reply": f"Something went wrong: {str(e)}",
-                    "cost": 0.0, "tokens": 0,
-                    "sources": [], "tools_used": [], "query_variants": [],
-                }
-        st.markdown(result["reply"])
-        tokens_info = f"{result['tokens']:,} tokens · {format_cost(result['cost'])}"
-        st.caption(tokens_info)
-        if result["sources"]:
-            source_str = " · ".join(f"*{s['book']}* p.{s['page']}" for s in result["sources"])
-            st.caption(f"📖 Sources: {source_str}")
-        if result["tools_used"]:
-            st.caption(f"🔧 Tools: {', '.join(result['tools_used'])}")
-
-    # Stamp time AFTER response is done — rate limit counts from here
+    # Update rate-limit timestamp immediately (before processing) to block rapid re-submissions
     st.session_state.last_message_time = datetime.now()
 
-    # Update session state
-    st.session_state.last_prompt_cost   = result["cost"]
-    st.session_state.last_prompt_tokens = result["tokens"]
-    st.session_state.session_cost      += result["cost"]
-    st.session_state.session_tokens    += result["tokens"]
+    # Add language instruction to the user message so the agent responds in the right language
+    detected_lang = detect_language(user_text)
+    lang_suffix = (
+        f"\n\n[SYSTEM NOTE — not visible to the user: "
+        f"The user's message is in {detected_lang}. "
+        f"You MUST respond ENTIRELY in {detected_lang}. "
+        f"Do NOT write even one sentence in any other language.]"
+    )
+
+    # Add to session state for UI
+    st.session_state.messages.append({"role": "user", "content": user_text})
+
+    # Render user message
+    with st.chat_message("user", avatar="👤"):
+        st.markdown(user_text)
+
+    # ── Build and invoke the ReAct agent ──────────────────────────────────
+    # Collect active tools based on sidebar toggles
+    active_tools = [
+        ALL_TOOLS[name]
+        for name, enabled in tool_states.items()
+        if enabled and name in ALL_TOOLS
+    ]
+
+    # Create agent with current settings
+    agent = create_therapy_agent(
+        provider=provider,
+        model=selected_model,
+        temperature=0.6,
+        tools=active_tools,
+        personality=selected_personality,
+    )
+
+    config = {"configurable": {"thread_id": st.session_state.thread_id}}
+
+    # Repair any corrupted chat history (e.g. from interrupted tool calls)
+    repair_chat_history(st.session_state.thread_id)
+
+    # Invoke the agent with streaming
+    with st.chat_message("assistant", avatar="🧠"):
+        full_response = ""
+        tools_used = []
+        sources = []
+        total_tokens = 0
+        total_cost = 0.0
+
+        status_placeholder = st.empty()
+        response_placeholder = st.empty()
+
+        try:
+            status_placeholder.caption("🔄 Thinking...")
+
+            # Stream the agent's response
+            for event in agent.stream(
+                {"messages": [HumanMessage(content=user_text + lang_suffix)]},
+                config,
+                stream_mode="messages",
+            ):
+                msg_chunk, metadata = event
+                node = metadata.get("langgraph_node", "")
+
+                # Tool results — extract tool names and sources
+                if isinstance(msg_chunk, ToolMessage):
+                    tool_name = msg_chunk.name or "tool"
+                    if tool_name not in tools_used:
+                        tools_used.append(tool_name)
+                    status_placeholder.caption(
+                        f"🔧 Using: {', '.join(tools_used)}..."
+                    )
+                    # Parse sources from retrieve_from_books results
+                    if tool_name == "retrieve_from_books" and msg_chunk.content:
+                        import re as _re
+                        for match in _re.finditer(r"\[(.+?)\s+p\.(\d+)\]", msg_chunk.content):
+                            sources.append({"book": match.group(1), "page": match.group(2)})
+
+                # AI message chunks — stream the final response
+                elif isinstance(msg_chunk, AIMessageChunk) and node == "agent":
+                    # Only stream text content (not tool-call tokens)
+                    if msg_chunk.content and not (
+                        hasattr(msg_chunk, "tool_call_chunks") and msg_chunk.tool_call_chunks
+                    ):
+                        full_response += msg_chunk.content
+                        response_placeholder.markdown(full_response + "▌")
+
+            # Finalise display
+            status_placeholder.empty()
+            if full_response:
+                response_placeholder.markdown(full_response)
+            else:
+                response_placeholder.markdown(
+                    "I'm sorry, something went wrong. Please try again."
+                )
+
+        except Exception as e:
+            status_placeholder.empty()
+            error_str = str(e).lower()
+            if "credit balance" in error_str or "billing" in error_str or "insufficient" in error_str:
+                full_response = "⚠️ The API credit balance is too low. Please switch to a different provider in Settings, or add credits to your account."
+            elif "rate limit" in error_str or "too many requests" in error_str:
+                full_response = "⚠️ The API is temporarily overloaded. Please wait a moment and try again."
+            elif "api key" in error_str or "authentication" in error_str or "unauthorized" in error_str:
+                full_response = "⚠️ There's an issue with the API key. Please check your `.env` file and restart the app."
+            elif "invalid_chat_history" in error_str or "toolmessage" in error_str:
+                full_response = "⚠️ The conversation history got corrupted. Please click **New Session** in the sidebar to start fresh."
+            else:
+                full_response = f"Something went wrong. Please try again or start a new session."
+            response_placeholder.markdown(full_response)
+
+        # ── Cost tracking ─────────────────────────────────────────────────
+        # Estimate tokens from response length (accurate tracking requires
+        # usage_metadata which is available on invoke but not stream chunks)
+        est_input_tokens = len(user_text.split()) * 2 + 500  # rough estimate
+        est_output_tokens = len(full_response.split()) * 2
+        total_tokens = est_input_tokens + est_output_tokens
+        total_cost = calculate_cost(selected_model, est_input_tokens, est_output_tokens)
+
+        tokens_info = f"~{total_tokens:,} tokens · {format_cost(total_cost)}"
+        st.caption(tokens_info)
+        if sources:
+            # Deduplicate sources
+            seen = set()
+            unique_sources = []
+            for s in sources:
+                key = f"{s['book']}_p{s['page']}"
+                if key not in seen:
+                    seen.add(key)
+                    unique_sources.append(s)
+            source_str = " · ".join(f"*{s['book']}* p.{s['page']}" for s in unique_sources[:8])
+            st.caption(f"📖 Sources: {source_str}")
+            sources = unique_sources[:8]
+        if tools_used:
+            st.caption(f"🔧 Tools: {', '.join(tools_used)}")
+
+        # Feedback button for this new response
+        fb_key = f"feedback_{len(st.session_state.messages)}_{st.session_state.thread_id}"
+        feedback = st.feedback("thumbs", key=fb_key)
+        if feedback is not None:
+            saved_key = f"feedback_saved_{len(st.session_state.messages)}_{st.session_state.thread_id}"
+            if saved_key not in st.session_state:
+                rating = "positive" if feedback == 1 else "negative"
+                save_feedback_entry(len(st.session_state.messages), rating, full_response[:300])
+                st.session_state[saved_key] = True
+
+    # ── Update session state ──────────────────────────────────────────────
+    # Note: last_message_time is already set at the start (before processing)
+    # to properly block rapid re-submissions via rate limiting.
+    st.session_state.last_prompt_cost = total_cost
+    st.session_state.last_prompt_tokens = total_tokens
+    st.session_state.session_cost += total_cost
+    st.session_state.session_tokens += total_tokens
 
     st.session_state.messages.append({
-        "role":           "assistant",
-        "content":        result["reply"],
-        "tokens_info":    tokens_info,
-        "sources":        result["sources"],
-        "tools_used":     result["tools_used"],
-        "query_variants": result["query_variants"],
+        "role":        "assistant",
+        "content":     full_response,
+        "tokens_info": tokens_info,
+        "sources":     sources,
+        "tools_used":  tools_used,
     })
 
-    # Rerun so sidebar token counts update
+    # Rerun so sidebar updates
     st.rerun()

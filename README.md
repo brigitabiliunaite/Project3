@@ -1,130 +1,129 @@
-# Specialised Chatbot — Advanced RAG & Tool Calling
+# Schema Therapy Agent — Sprint 3
 
-## Task description
+## Problem Definition
 
-Create a specialised chatbot that leverages advanced RAG techniques and tool calling to provide domain-specific assistance. The goal is to build something that could be valuable in a real-world context. We will be using LangChain, your framework (Streamlit or Next.js) of choice, and implementing advanced RAG techniques. The intended code editor for this project is **VS Code**.
+**What problem does this solve?**
 
-Your chatbot will:
-1. Implement advanced RAG with query translation and structured retrieval
-2. Include tool calling capabilities for practical tasks
-3. Focus on a specific domain or use case
-4. Provide detailed, context-aware responses
+Schema therapy is a powerful psychotherapy model, but accessing its concepts, identifying personal schemas, and finding practical exercises requires reading dense clinical textbooks. Most people who could benefit from schema therapy insights don't have the time or background to read these books.
 
-Example use cases (but feel free to create your own):
-- Career Consultant Bot: Uses World Economic Forum reports and job market data to provide career advice
-- Technical Documentation Assistant: Helps developers understand and work with specific frameworks or libraries
-- Financial Advisor Bot: Analyses market trends and provides investment insights
-- Healthcare Information Assistant: Provides accurate medical information from verified sources
-- Legal Research Assistant: Helps with legal queries using case law and legal documents
+**How does this app address it?**
 
----
+This agent acts as a schema therapy coach — a conversational AI that has "studied" the books and can explain concepts, identify schemas and modes, suggest exercises, and remember past conversations. It makes evidence-based psychological knowledge accessible and personalised.
 
-## My chosen use case
-
-**Schema Therapy Coaching Bot** — a conversational AI chatbot grounded in schema therapy literature. Schema therapy, developed by Jeffrey Young, is a psychotherapy model focused on identifying deep emotional patterns (schemas) formed in childhood that affect adult life. The bot answers questions, identifies schemas and modes, suggests practical exercises, and remembers past sessions — all based on real schema therapy books indexed from PDF. It makes evidence-based psychological knowledge accessible in a conversational, personalised way.
+**Target users:**
+- People exploring schema therapy for personal growth
+- Therapy clients who want to understand their patterns between sessions
+- Students learning schema therapy concepts
+- Anyone curious about emotional patterns and coping styles
 
 ---
 
-## Task requirements
+## What This Agent Does
 
-### Core requirements
+- **Answers questions** about schema therapy, early maladaptive schemas, and modes using content retrieved directly from indexed books
+- **Identifies schemas and modes** in what the user describes — naming the Vulnerable Child, Detached Protector, etc. and explaining what it means for their specific situation
+- **Suggests practical exercises** grounded in the literature, with step-by-step instructions
+- **Remembers past sessions** and connects themes across conversations
+- **Responds in any language** the user writes in (55 languages via langdetect)
+- **Learns from feedback** — adapts its style based on 👍/👎 ratings over time
+- **Supports multiple LLMs** — OpenAI and Anthropic models, switchable in the UI
 
-| # | Requirement | Status |
+---
+
+## Architecture: ReAct Agent (Sprint 3)
+
+This is a **LangGraph ReAct agent**, not a fixed pipeline. The key difference:
+
+| Aspect | Pipeline (Sprint 2) | Agent (Sprint 3) |
 |---|---|---|
-| 1 | RAG Implementation — knowledge base, embeddings, chunking, similarity search | ✅ |
-| 2 | Tool Calling — at least 3 relevant tool calls | ✅ 3 tools |
-| 3 | Domain Specialisation — focused knowledge base, domain prompts, security | ✅ |
-| 4 | Technical Implementation — LangChain, error handling, logging, validation, rate limiting, API key management | ✅ |
-| 5 | User Interface — Streamlit, sources, tool call results, progress indicators | ✅ |
+| Control flow | Developer decides each step | Agent decides dynamically |
+| Retrieval | Always happens, every message | Agent decides when to search books |
+| Tool usage | Fixed, one round | Agent can call multiple tools, multiple rounds |
+| Stopping | After one response | Agent decides when it has enough info |
 
-### Implemented optional tasks
+**The ReAct loop:**
+```
+User message → Agent reasons → Need book info? → retrieve_from_books
+                             → Need an exercise? → find_technique
+                             → Past session reference? → search_memory
+                             → Client needs encouragement? → get_affirmation
+                             → Done? → Final response
+```
 
-**Easy**
-- ✅ Easy #1 — Conversation history: sessions saved to JSON, searchable in future conversations
-- ✅ Easy #3 — Source citations: every response shows book name and page number
-
-**Medium**
-- ✅ Medium #2 — Real-time knowledge base updates: SHA256 fingerprint detection + Update Index button
-- ✅ Medium #5 — Token usage and cost display: shown per message and as session total
-
-**Hard**
-- ✅ Hard #6 — Multi-language support: automatic per-message language detection using `langdetect` (55 languages), with Lithuanian character fallback
+The agent is built with `create_react_agent` from LangGraph, which implements the Reason + Act pattern: the LLM alternates between reasoning about what to do next and acting via tool calls, observing results, and deciding whether to continue or respond.
 
 ---
 
-## 🧠 Schema Therapy Bot
-
-A conversational AI chatbot built with Streamlit and LangChain, grounded in schema therapy literature. The bot answers questions, suggests practical exercises, and remembers past sessions — all based on real schema therapy books indexed from PDF.
-
-### What it does
-
-- Answers questions about schema therapy, early maladaptive schemas, and psychological modes using content retrieved directly from indexed books
-- Suggests practical step-by-step exercises grounded in the literature
-- Remembers past therapy sessions and references them in future conversations
-- Responds in whatever language the user writes in (55 languages via `langdetect`)
-- Tracks token usage and dollar cost per message and per session
-- Saves sessions with an AI-generated title, summary, and key themes
-
----
-
-### Tech stack
+## Tech Stack
 
 | Component | Technology |
 |---|---|
 | Frontend | Streamlit |
-| LLM | OpenAI `gpt-4o-mini` |
-| Embeddings | OpenAI `text-embedding-3-small` |
-| Vector database | ChromaDB (local) |
+| Agent framework | LangGraph (ReAct agent) |
+| LLM (default) | OpenAI GPT-4o-mini |
+| LLM (alternative) | Anthropic Claude Sonnet 4 / Haiku 4 |
+| Embeddings | OpenAI text-embedding-3-small |
+| Vector database | ChromaDB (local, persistent) |
 | LLM framework | LangChain |
-| Monitoring | LangSmith |
-| PDF loading | LangChain `PyPDFLoader` |
-| Language detection | `langdetect` |
+| Memory | LangGraph MemorySaver (within-session) + ChromaDB (cross-session) |
+| Observability | LangSmith |
+| PDF loading | LangChain PyPDFLoader |
+| Language detection | langdetect |
+| External API | zenquotes.io (affirmations) |
 
 ---
 
-### Project structure
+## Project Structure
 
 ```
-app.py          — Streamlit UI, agent loop, security, session management
-rag.py          — PDF ingestion, chunking, embedding, advanced retrieval
-tools.py        — 3 LangChain tools: save_session, search_memory, find_technique
-costs.py        — Token counting and cost calculation
+app.py            — Streamlit UI, agent invocation, streaming, feedback
+agent.py          — LangGraph ReAct agent factory, LLM factory, prompt builder
+tools.py          — 5 LangChain tools with Pydantic validation
+rag.py            — PDF ingestion, chunking, embedding, advanced retrieval
+costs.py          — Multi-model token usage and cost calculation
+feedback.py       — Feedback storage and analysis (learning agent)
+prompts.py        — YAML prompt loader
+prompts.yaml      — Externalised system/tool/personality prompts
+pyproject.toml    — Project metadata and dependencies
 
 data/
-  books/              — schema therapy PDF books (add your own here)
-  sessions/           — saved session JSON files (auto-created)
-  vectorstore/        — ChromaDB book embeddings (auto-created on first run)
-  memory_vectorstore/ — ChromaDB session memory embeddings (auto-created)
+  books/              — Schema therapy PDF books (add your own)
+  sessions/           — Saved session JSON files (auto-created)
+  vectorstore/        — ChromaDB book embeddings (auto-created)
+  memory_vectorstore/ — ChromaDB session memory (auto-created)
+  feedback.json       — User feedback ratings (auto-created)
 
-.env            — API keys (see Setup)
+.env              — API keys (see Setup)
 ```
 
 ---
 
-### Setup
+## Setup
 
-**Requirements:** Python 3.11
+**Requirements:** Python 3.10+
 
 ```bash
 # Create and activate virtual environment
-python3.11 -m venv venv
-source venv/bin/activate        # Mac/Linux
-venv\Scripts\activate           # Windows
+python3 -m venv venv
+source venv/bin/activate
 
 # Install dependencies
-pip install streamlit langchain langchain-openai langchain-community \
-    langchain-chroma chromadb pypdf python-dotenv langsmith \
-    langchain-text-splitters langdetect
+pip install streamlit langchain langchain-openai langchain-anthropic \
+    langchain-community langchain-chroma langgraph langgraph-prebuilt \
+    langgraph-checkpoint chromadb pypdf python-dotenv langsmith \
+    langchain-text-splitters langdetect backoff pyyaml requests pydantic
 ```
 
 **Create a `.env` file** in the project root:
-
 ```
 OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-ant-...
 LANGCHAIN_TRACING_V2=true
 LANGCHAIN_API_KEY=ls__...
-LANGCHAIN_PROJECT=schema-therapy-bot
+LANGCHAIN_PROJECT=schema-therapy-agent
 ```
+
+> Note: `ANTHROPIC_API_KEY` is optional. Without it, only OpenAI models are available.
 
 **Add your books:** drop schema therapy PDF files into `data/books/`.
 
@@ -133,82 +132,106 @@ LANGCHAIN_PROJECT=schema-therapy-bot
 streamlit run app.py
 ```
 
-The app indexes all books automatically on first startup. To add books later, click the **🔄 Update Book Index** button in the sidebar.
+---
+
+## The 5 Tools
+
+| # | Tool | Type | What it does |
+|---|---|---|---|
+| 1 | `retrieve_from_books` | Agentic RAG | Searches indexed books for relevant passages. The agent decides when to call this. |
+| 2 | `find_technique` | Domain tool | Finds practical exercises from the books with step-by-step instructions. |
+| 3 | `search_memory` | Memory tool | Searches past session notes for cross-session context. |
+| 4 | `save_session` | Persistence tool | Saves the session with AI-generated title, summary, and themes. |
+| 5 | `get_affirmation` | External API | Fetches inspirational quotes from zenquotes.io for encouragement. |
+
+All tools have **Pydantic input schemas** for field-level validation (max_length, descriptions). Tools are **dynamically toggleable** — users can enable/disable tools via sidebar checkboxes.
 
 ---
 
-### How RAG works
+## How Agentic RAG Works (Hard #1)
 
-RAG (Retrieval Augmented Generation) means the bot answers questions using your actual books, not just what the AI was trained on.
+In a normal RAG pipeline, retrieval happens on every message. In **agentic RAG**, the agent decides when to search:
 
-1. **Chunking** — each PDF is split into 1000-character chunks with 200-character overlap using `RecursiveCharacterTextSplitter`
-2. **Embedding** — each chunk is converted to a vector using OpenAI `text-embedding-3-small` and stored in ChromaDB
-3. **Query translation** — the user's message is rewritten into 3 schema therapy search variants by the LLM (e.g. "I feel alone" → `["emotional deprivation schema", "unmet attachment needs", "social isolation coping patterns"]`)
-4. **MMR retrieval** — each variant searches ChromaDB using Maximal Marginal Relevance, returning diverse results from different parts of different books
-5. **Context injection** — retrieved chunks are injected into the LLM prompt so the answer is grounded in the books
-6. **Source citations** — each response shows the book name and page number of every chunk used
+1. User says "hello" → Agent responds directly (no retrieval needed)
+2. User asks "what is the abandonment schema?" → Agent calls `retrieve_from_books` → reads passages → responds grounded in books
+3. User asks "give me an exercise" → Agent calls `retrieve_from_books` AND `find_technique` → combines both results
 
----
-
-### The 3 tools
-
-| Tool | Triggered when | What it does |
-|---|---|---|
-| `find_technique` | User asks for an exercise or step-by-step practice | Searches books for exercises, generates a focused technique |
-| `save_session` | User clicks Save & End or says goodbye | LLM generates title/summary/themes, saves JSON, embeds into memory |
-| `search_memory` | User references a past session | Searches the memory vectorstore for relevant past conversation chunks |
-
-Tools are registered with `llm.bind_tools()`. The LLM reads their docstring descriptions and decides autonomously when to call each one. Results are passed back as `ToolMessage` objects before the final response.
+The retrieval tool uses **advanced RAG** internally:
+- **Query translation**: rewrites the query into 3 clinical variants via LLM
+- **MMR retrieval**: Maximal Marginal Relevance for diverse, non-redundant results
+- **Per-source cap**: max 4 chunks from any single book
 
 ---
 
-### Security
+## How the Learning Agent Works (Hard #4)
+
+1. Every assistant response has 👍/👎 feedback buttons
+2. Ratings are stored in `data/feedback.json` with response snippets
+3. Before each agent call, `get_feedback_insights()` analyses recent feedback
+4. Insights are injected into the system prompt: "User prefers concise responses", "User appreciates practical exercises"
+5. The agent adapts its communication style over time
+
+This implements the **learning agent** pattern from Sprint 3: performance element (agent), critic (user feedback), learning element (feedback analysis), and the loop between them.
+
+---
+
+## Optional Tasks Implemented
+
+### Easy
+- **#1** — Critique: Project 2 was reviewed and all 9 feedback areas were addressed
+- **#2** — Personality: sidebar dropdown (Warm & Supportive / Professional & Clinical / Concise & Direct)
+- **#3** — LLM choice: sidebar dropdown to choose between OpenAI and Anthropic models
+- **#5** — Help guide: expandable "How to use this bot" section in sidebar
+
+### Medium
+- **#1** — Token usage and cost display: per-message and session totals, multi-model pricing
+- **#2** — Retry logic: exponential backoff on all LLM/API calls, max_retries on model instances
+- **#3** — Memory: LangGraph MemorySaver (within-session) + ChromaDB vectorstore (cross-session)
+- **#4** — External API tool: `get_affirmation` calls zenquotes.io for motivational quotes
+- **#7** — Feedback loop: 👍/👎 buttons, stored ratings, feedback insights in system prompt
+- **#8** — 5 tools with enable/disable toggles in the sidebar
+- **#9** — Multi-model: OpenAI (GPT-4o-mini, GPT-4o) + Anthropic (Claude Sonnet 4, Haiku 4)
+
+### Hard
+- **#1** — Agentic RAG: retrieval is a tool the agent decides to use, not a fixed pipeline step
+- **#2** — LLM observability: LangSmith tracing for all agent interactions
+- **#4** — Learning from feedback: agent adapts style based on accumulated user ratings
+
+**Total: 4 easy + 7 medium + 3 hard**
+
+---
+
+## Security
 
 - **Input length limit** — messages over 2000 characters are rejected
-- **Prompt injection detection** — phrases like `"ignore previous instructions"` are blocked before reaching the LLM
-- **Rate limiting** — 15-second cooldown between messages
-- **Domain restriction** — system prompt restricts the LLM to schema therapy topics only
-- **API key management** — all keys loaded from `.env` via `python-dotenv`, never hardcoded
+- **Prompt injection detection** — NFKD normalisation + suspicious pattern matching
+- **Rate limiting** — 5-second cooldown between messages
+- **Domain restriction** — system prompt limits to schema therapy topics
+- **Tool input validation** — Pydantic schemas with max_length on all tool inputs
+- **API key management** — all keys in `.env` via python-dotenv
 
 ---
 
-### Monitoring and logging
+## Agent Types (Sprint 3 Concepts)
 
-All interactions are traced in LangSmith (`smith.langchain.com`, project: `schema-therapy-bot`). Each trace shows the full message chain, which tools were called, token counts per step, and latency. Terminal logs show retrieval statistics after each message.
+This project demonstrates several agent architecture concepts:
 
----
+| Concept | Implementation |
+|---|---|
+| **ReAct pattern** | LangGraph `create_react_agent` — reason about what tool to use, act, observe, repeat |
+| **Goal-based agent** | Agent has the goal of helping with schema therapy; plans tool calls to achieve it |
+| **Learning agent** | Feedback loop adapts behaviour based on user ratings |
+| **Agentic RAG** | Agent-controlled retrieval — decides when and what to search |
+| **Tool state access** | Tools access session state and vector stores independently |
 
-### Session persistence
-
-When a session is saved:
-1. LLM generates a `title`, `summary`, and `key_themes`
-2. JSON file saved to `data/sessions/TIMESTAMP_TITLE.json` with full conversation text
-3. Conversation embedded into memory vectorstore for future retrieval
-4. Appears in the sidebar under **Past Sessions**
-
----
-
-### Optional tasks in detail
-
-**Hard #6 — Multi-language support**
-Per-message language detection using the `langdetect` library (supports 55 languages). The detected language is injected as an explicit override into the system prompt for every message, ensuring the response language stays consistent even when tool results come back in a different language. Falls back to Lithuanian character detection if `langdetect` fails on very short or ambiguous input.
-
-**Medium #5 — Token usage and cost tracking**
-Every response shows token count and dollar cost. The sidebar shows session totals. Calculated in `costs.py` using OpenAI's published pricing for `gpt-4o-mini` (input: $0.000150/1K, output: $0.000600/1K).
-
-**Medium #2 — Real-time knowledge base updates**
-SHA256 fingerprinting of each file's name, size, and modification timestamp detects when books change. The sidebar shows a warning when the index is stale. The **🔄 Update Book Index** button rebuilds in-place using batched embedding (100 chunks per request) to stay within OpenAI payload limits.
-
-**Easy #3 — Source citations**
-Every response displays `📖 Sources: *Book Name* p.83 · p.134` — book name and page number for each retrieved chunk.
-
-**Easy #1 — Conversation history**
-Sessions persist as JSON files on disk and are searchable via the memory vectorstore in future sessions.
+The agent is NOT a simple reflex agent (no memory) or a fixed pipeline (predetermined steps). It dynamically reasons about which tools to use based on the conversation context.
 
 ---
 
-### Potential improvements
+## Potential Improvements
 
-- **Streaming responses** — display text word by word as it generates (`llm.stream()` + `st.write_stream()`)
-- **RAGAs evaluation** — objectively measure retrieval quality (Hard task #9)
-- **Always-on memory search** — search memory on every message with a similarity threshold rather than keyword triggering
+- **Human-in-the-loop**: add approval steps before save_session or sensitive recommendations
+- **Multi-agent**: separate "diagnosis" and "exercise" agents that collaborate
+- **Cloud deployment**: containerise with Docker, deploy to Railway or Render
+- **RAGAs evaluation**: objectively measure retrieval quality
+- **Fine-tuning**: train a specialised model on schema therapy Q&A pairs

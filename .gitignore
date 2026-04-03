@@ -3,7 +3,15 @@ venv/
 data/vectorstore/
 data/memory_vectorstore/
 data/sessions/
+data/feedback.json
+data/uploads/
 __pycache__/
 *.pyc
 *.pyo
 .DS_Store
+.claude/
+sales-preview/
+125.md
+{data/
+TESTING_GUIDE.md
+EVALUATION_PREP.md

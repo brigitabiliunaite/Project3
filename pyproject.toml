@@ -1,0 +1,38 @@
+[project]
+name = "schema-therapy-agent"
+version = "2.0.0"
+description = "Schema therapy coaching agent with LangGraph ReAct, agentic RAG, multi-model support, and learning from feedback"
+requires-python = ">=3.10"
+dependencies = [
+    "streamlit>=1.55.0",
+    "langchain>=1.2.10",
+    "langchain-openai>=1.1.10",
+    "langchain-anthropic>=0.3.0",
+    "langchain-community>=0.4.1",
+    "langchain-chroma>=1.1.0",
+    "langchain-text-splitters>=1.1.1",
+    "langgraph>=1.0.10",
+    "langgraph-prebuilt>=1.0.8",
+    "langgraph-checkpoint>=4.0.1",
+    "chromadb>=1.5.2",
+    "openai>=2.24.0",
+    "pypdf>=6.7.5",
+    "python-dotenv>=1.2.2",
+    "langdetect>=1.0.9",
+    "tiktoken>=0.12.0",
+    "pydantic>=2.12.5",
+    "backoff>=2.2.1",
+    "PyYAML>=6.0.3",
+    "requests>=2.32.0",
+    "langsmith>=0.7.12",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.backends"
