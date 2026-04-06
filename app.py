@@ -343,11 +343,12 @@ with st.sidebar:
 
     # ── Tools (collapsed by default) ──────────────────────────────────────
     with st.expander("Tools", expanded=False):
+        st.caption("Toggle agent capabilities:")
         tool_states = {}
         for tool_name, description in TOOL_DESCRIPTIONS.items():
             if tool_name == "save_session":
+                # save_session is handled by the "Save & End" button, not shown here
                 tool_states[tool_name] = True
-                st.checkbox(description, value=True, disabled=True, key=f"tool_{tool_name}")
             else:
                 tool_states[tool_name] = st.checkbox(
                     description, value=True, key=f"tool_{tool_name}",
@@ -476,6 +477,23 @@ msg_count = len([m for m in st.session_state.messages if m["role"] == "user"])
 if msg_count >= MAX_MESSAGES_SESSION:
     st.warning(f"You've sent {msg_count} messages. Consider saving and starting a new session.")
 
+# ── Suggested prompts (shown only before first user message) ─────────────
+user_msgs = [m for m in st.session_state.messages if m["role"] == "user"]
+if not user_msgs:
+    st.markdown("##### Try asking:")
+    prompt_cols = st.columns(2)
+    suggested = [
+        "What is the abandonment schema?",
+        "I feel like nobody really cares about me",
+        "Give me an exercise for emotional deprivation",
+        "Can you share an inspiring quote?",
+    ]
+    for idx, prompt_text in enumerate(suggested):
+        with prompt_cols[idx % 2]:
+            if st.button(prompt_text, key=f"suggested_{idx}", use_container_width=True):
+                st.session_state._suggested_prompt = prompt_text
+                st.rerun()
+
 # Welcome message
 if not st.session_state.messages:
     st.session_state.messages.append({
@@ -532,6 +550,11 @@ if st.session_state.get("session_saved"):
     user_input = None
 else:
     user_input = st.chat_input("Write a message...")
+
+# Handle suggested prompt clicks
+if hasattr(st.session_state, "_suggested_prompt") and st.session_state._suggested_prompt:
+    user_input = st.session_state._suggested_prompt
+    del st.session_state._suggested_prompt
 
 if user_input and user_input.strip():
     # Rate limit
