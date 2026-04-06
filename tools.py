@@ -155,14 +155,21 @@ def search_memory(query: str) -> str:
     'previous session') or when connecting current themes to earlier patterns."""
     try:
         memory_store = _get_memory_store()
-        results = memory_store.similarity_search(query, k=3)
+        results = memory_store.similarity_search(query, k=8)
     except Exception:
         return "No past sessions found yet."
 
     if not results:
         return "No relevant past session notes found on this topic."
 
-    parts = ["**Relevant memories from past sessions:**\n"]
+    parts = [
+        "**Relevant memories from past sessions:**\n",
+        "IMPORTANT: Only state facts that appear EXACTLY in the text below. "
+        "If the user asks about something specific (like quotes, names, details) "
+        "and you cannot find it in this text, say 'I can see we discussed [topic] "
+        "but I don't have the exact details in my notes.' NEVER invent or guess "
+        "details that are not written below.\n",
+    ]
     for i, doc in enumerate(results, 1):
         parts.append(f"**Memory {i}:**\n{doc.page_content}\n")
     return "\n".join(parts)
@@ -235,15 +242,21 @@ def save_session(reason: str) -> str:
 
     # Embed into memory vectorstore for cross-session retrieval
     memory_store = _get_memory_store()
+    session_date = datetime.now().strftime('%B %d, %Y')
     summary_text = (
         f"Session: {notes['title']}\n"
-        f"Date: {datetime.now().strftime('%B %d, %Y')}\n"
+        f"Date: {session_date}\n"
         f"Summary: {notes['summary']}\n"
         f"Themes: {', '.join(notes['key_themes'])}"
     )
-    chunk_size = 1500
+    # Smaller chunks (800 chars) so details like quotes, names, etc. stay intact
+    chunk_size = 800
     conv_chunks = [conversation[i:i + chunk_size] for i in range(0, len(conversation), chunk_size)]
-    all_texts = [summary_text] + conv_chunks
+    # Prepend date and title to each chunk so search can find by date
+    all_texts = [summary_text] + [
+        f"[Session: {notes['title']} | Date: {session_date}]\n{chunk}"
+        for chunk in conv_chunks
+    ]
     all_meta = [{"timestamp": timestamp, "title": notes["title"], "type": "summary"}] + [
         {"timestamp": timestamp, "title": notes["title"], "type": "full_text", "chunk": i}
         for i in range(len(conv_chunks))
